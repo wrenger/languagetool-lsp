@@ -1,5 +1,5 @@
 [package]
-name = "zed-crates-io"
+name = "languagetool-lsp-zed"
 version = "0.1.0"
 edition = "2024"
 

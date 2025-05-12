@@ -27,7 +27,7 @@ And then add the following Zed configuration:
 ```json
 {
   "lsp": {
-    "crates-io": {
+    "languagetool-lsp": {
       "initialization_options": {},
       "binary": {
         "path": "<path/to>/languagetool-lsp/target/release/languagetool-lsp",
