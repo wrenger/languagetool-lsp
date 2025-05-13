@@ -3,13 +3,15 @@ use std::collections::HashMap;
 use anyhow::Result;
 use api::Match;
 use changes::Changes;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_lsp_server::lsp_types::{
-    CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-    Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DiagnosticSeverity,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
-    MessageType, Range as DocRange, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    self, CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability,
+    CodeActionResponse, Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities,
+    DiagnosticSeverity, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    ExecuteCommandOptions, ExecuteCommandParams, InitializeParams, InitializeResult, MessageType,
+    Range as DocRange, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server, jsonrpc};
@@ -53,6 +55,10 @@ impl LanguageServer for Backend {
                     },
                 )),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec!["languagetool-lsp.check".to_string()],
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -203,8 +209,57 @@ impl LanguageServer for Backend {
                 }
             }
         }
+
+        // Check spelling
+        actions.push(CodeAction {
+            title: "Check Spelling".to_string(),
+            kind: Some(CodeActionKind::SOURCE),
+            command: Some(lsp_types::Command {
+                title: "Check Spelling".to_string(),
+                command: "languagetool-lsp.check".to_string(),
+                arguments: Some(vec![
+                    serde_json::to_value(CheckCommandParams {
+                        text_document: params.text_document.clone(),
+                        range: params.range,
+                    })
+                    .unwrap(),
+                ]),
+            }),
+            ..Default::default()
+        });
+
         Ok((!actions.is_empty()).then_some(actions.into_iter().map(|a| a.into()).collect()))
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> jsonrpc::Result<Option<lsp_types::LSPAny>> {
+        info!("ExecuteCommand: {:?}", params.command);
+        if params.command == "languagetool-lsp.check" {
+            let params = serde_json::from_value::<CheckCommandParams>(params.arguments[0].clone())
+                .map_err(|e| jsonrpc::Error::invalid_params(format!("Invalid params: {e}")))?;
+
+            let mut open_docs = self.documents.write().await;
+            let Some(doc) = open_docs.get_mut(&params.text_document.uri) else {
+                error!("No document found: {}", params.text_document.uri.as_str());
+                return Ok(None);
+            };
+            doc.changed_lines.add_change(
+                params.range.start.line as usize..params.range.end.line as usize + 1,
+                params.range.end.line as usize - params.range.start.line as usize + 1,
+            );
+            self.update_diagnostics(&params.text_document.uri, doc)
+                .await;
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckCommandParams {
+    text_document: lsp_types::TextDocumentIdentifier,
+    range: lsp_types::Range,
 }
 
 impl Backend {
