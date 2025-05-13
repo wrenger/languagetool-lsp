@@ -28,8 +28,7 @@ impl AnnotatedText {
         })
     }
     pub fn optimize(&mut self) {
-        let old = std::mem::take(&mut self.annotation);
-        for old in old {
+        for old in std::mem::take(&mut self.annotation) {
             match (old, self.annotation.last_mut()) {
                 (Annotation::Text { text }, Some(Annotation::Text { text: last_text })) => {
                     last_text.push_str(&text);
@@ -49,6 +48,12 @@ impl AnnotatedText {
                 (old, _) => self.annotation.push(old),
             }
         }
+    }
+    pub fn len(&self) -> usize {
+        self.annotation.iter().map(|a| match a {
+            Annotation::Text { text } => text.len(),
+            Annotation::Markup { markup, .. } => markup.len(),
+        }).sum()
     }
 }
 

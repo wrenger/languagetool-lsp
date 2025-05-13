@@ -1,20 +1,23 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use api::Match;
+use changes::Changes;
 use tokio::sync::RwLock;
 use tower_lsp_server::lsp_types::{
     CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-    Diagnostic, DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, InitializeParams, InitializeResult, MessageType, Range,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    Uri, WorkspaceEdit,
+    Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DiagnosticSeverity,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
+    MessageType, Range as DocRange, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server, jsonrpc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod annotated;
 mod api;
+mod changes;
 mod settings;
 mod source;
 mod util;
@@ -26,21 +29,29 @@ use source::SourceFile;
 struct Backend {
     client: Client,
     settings: RwLock<Settings>,
-    open_docs: RwLock<HashMap<Uri, SourceFile>>,
+    /// Currently open documents
+    documents: RwLock<HashMap<Uri, Document>>,
 }
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         info!("Init {:?}", params.initialization_options);
         info!("{:?}", params.capabilities.general);
+        info!(
+            "{:?}",
+            params.capabilities.text_document.and_then(|d| d.diagnostic)
+        );
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
-                diagnostic_provider: Some(
-                    DiagnosticServerCapabilities::Options(Default::default()),
-                ),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("languagetool-lsp".to_string()),
+                        ..Default::default()
+                    },
+                )),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
@@ -52,7 +63,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        info!("Config: {:#?}", params.settings);
+        info!("Settings: {:?}", params.settings);
         *self.settings.write().await = serde_json::from_value(params.settings).unwrap();
     }
 
@@ -63,11 +74,11 @@ impl LanguageServer for Backend {
             params.text_document.uri.as_str()
         );
 
-        self.open_docs.write().await.insert(
-            params.text_document.uri.clone(),
-            SourceFile::new(
-                params.text_document.text.clone(),
-                params.text_document.version,
+        self.documents.write().await.insert(
+            params.text_document.uri,
+            Document::new(
+                SourceFile::new(params.text_document.text),
+                Some(params.text_document.version),
             ),
         );
     }
@@ -79,11 +90,38 @@ impl LanguageServer for Backend {
             params.text_document.uri.as_str()
         );
 
-        let mut open_docs = self.open_docs.write().await;
+        let mut open_docs = self.documents.write().await;
         let doc = open_docs.get_mut(&params.text_document.uri).unwrap();
         for change in params.content_changes {
-            assert!(change.range.is_none());
-            *doc = SourceFile::new(change.text.clone(), params.text_document.version);
+            if let Some(range) = change.range {
+                doc.changed_lines.add_change(
+                    range.start.line as usize..range.end.line as usize + 1,
+                    change.text.split('\n').count(),
+                );
+
+                let start = doc.source.to_offset(range.start).unwrap();
+                let end = doc.source.to_offset(range.end).unwrap();
+
+                doc.source.replace(start..end, &change.text);
+                doc.version = Some(params.text_document.version);
+
+                // Update positions for matches behind the change
+                let shift = change.text.len() as isize - (end as isize - start as isize);
+                for m in &mut doc.matches {
+                    if m.range.start >= end {
+                        m.range.start = (m.range.start as isize + shift) as usize;
+                    }
+                    if m.range.end >= end {
+                        m.range.end = (m.range.end as isize + shift) as usize;
+                    }
+                }
+            } else {
+                // No range means replace the whole document
+                doc.source = SourceFile::new(change.text);
+                doc.version = Some(params.text_document.version);
+                doc.matches.clear();
+                doc.changed_lines.clear();
+            }
         }
     }
 
@@ -95,14 +133,21 @@ impl LanguageServer for Backend {
 
         info!("DidSave: {}", text_document.uri.as_str());
 
-        let mut open_docs = self.open_docs.write().await;
+        let mut open_docs = self.documents.write().await;
         let Some(doc) = open_docs.get_mut(&text_document.uri) else {
             error!("No document found: {}", text_document.uri.as_str());
             return;
         };
+
         if let Some(text) = text {
-            *doc = SourceFile::new(text.clone(), doc.version());
+            if text != doc.source.text() {
+                warn!("Document has dirty changes! {}", text_document.uri.as_str());
+                doc.source = SourceFile::new(text);
+                doc.changed_lines
+                    .add_change(0..doc.source.lines().len(), doc.source.lines().len());
+            }
         };
+
         self.update_diagnostics(&text_document.uri, doc).await;
     }
 
@@ -114,7 +159,7 @@ impl LanguageServer for Backend {
             .publish_diagnostics(params.text_document.uri.clone(), Vec::new(), None)
             .await;
 
-        let mut open_docs = self.open_docs.write().await;
+        let mut open_docs = self.documents.write().await;
         open_docs.remove(&params.text_document.uri);
     }
 
@@ -163,50 +208,94 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    async fn update_diagnostics(&self, uri: &Uri, source: &SourceFile) {
-        match self.collect_diagnostics(source).await {
-            Ok(diagnostics) => {
-                self.client
-                    .publish_diagnostics(uri.clone(), diagnostics, Some(source.version()))
-                    .await
-            }
-            Err(err) => {
-                error!("Failed diagnostics: {err}");
-                self.client
-                    .show_message(MessageType::ERROR, format!("{err}"))
-                    .await;
-            }
+    async fn update_diagnostics(&self, uri: &Uri, doc: &mut Document) {
+        if let Err(err) = self.update_matches(doc).await {
+            error!("Failed diagnostics: {err}");
+            self.client
+                .show_message(MessageType::ERROR, format!("{err}"))
+                .await;
+        } else {
+            let diags = doc.diagnostics();
+            self.client
+                .publish_diagnostics(uri.clone(), diags, doc.version)
+                .await
         }
     }
 
-    async fn collect_diagnostics(&self, source: &SourceFile) -> Result<Vec<Diagnostic>> {
-        let mut annot = AnnotatedText::new();
-        // TODO: Parse markdown/latex/typst
-        annot.add_text(source.text().into());
-        annot.optimize();
+    async fn update_matches(&self, doc: &mut Document) -> Result<()> {
+        let changes = doc.changed_lines.changes().clone();
+        doc.changed_lines.clear();
 
-        info!("Check: {:?}", source.text().len());
-        let settings = self.settings.read().await.clone();
-        // TODO: Only check the changed range
-        let matches = api::check(annot, 0, &settings, None).await?;
-        info!("Matches: {}", matches.len());
+        for lines in changes {
+            // TODO: Parse markdown/latex/typst
+            info!("Check lines: {lines:?}");
 
-        for m in &matches {
-            info!(
-                "Match: {} {} {:?} {}",
-                m.range.start,
-                m.range.end,
-                &source.text()[m.range.clone()],
-                m.title
-            );
+            let (line_range, text) = doc
+                .source
+                .line_range(lines.clone())
+                .ok_or_else(|| anyhow!("Invalid Lines"))?;
+
+            if text.trim().is_empty() {
+                info!("Skip checking whitespace");
+                continue;
+            }
+
+            let mut annot = AnnotatedText::new();
+            annot.add_text(text.into());
+            annot.optimize();
+
+            info!("Check len {}", annot.len());
+            let settings = self.settings.read().await.clone();
+            let mut matches = api::check(annot, line_range.0.byte, &settings, None).await?;
+            info!("Matches: {}", matches.len());
+
+            for m in &matches {
+                info!(
+                    "Match: {} {} {}: {:?}\n-> {:?}",
+                    m.range.start,
+                    m.range.end,
+                    m.title,
+                    &doc.source.text()[m.range.clone()],
+                    &m.replacements
+                );
+            }
+
+            let line_range = line_range.0.byte..line_range.1.byte;
+            // Remove matches that overlap with the changed lines
+            doc.matches
+                .retain(|m| m.range.end < line_range.start || m.range.start > line_range.end);
+            doc.matches.append(&mut matches);
         }
 
-        let diagnostics = matches
-            .into_iter()
+        Ok(())
+    }
+}
+
+struct Document {
+    source: SourceFile,
+    version: Option<i32>,
+    matches: Vec<Match>,
+    changed_lines: Changes,
+}
+impl Document {
+    fn new(source: SourceFile, version: Option<i32>) -> Self {
+        let mut changed_lines = Changes::new();
+        // Initially everyting is changed
+        changed_lines.add_change(0..source.lines().len(), source.lines().len());
+        Self {
+            source,
+            version,
+            matches: Vec::new(),
+            changed_lines,
+        }
+    }
+    fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.matches
+            .iter()
             .map(|m| Diagnostic {
-                range: Range {
-                    start: source.to_position(m.range.start).unwrap(),
-                    end: source.to_position(m.range.end).unwrap(),
+                range: DocRange {
+                    start: self.source.to_position(m.range.start).unwrap(),
+                    end: self.source.to_position(m.range.end).unwrap(),
                 },
                 data: Some(m.replacements.clone().into()),
                 message: format!(
@@ -223,9 +312,7 @@ impl Backend {
                 source: Some("languagetool-lsp".into()),
                 ..Default::default()
             })
-            .collect();
-
-        Ok(diagnostics)
+            .collect()
     }
 }
 
@@ -241,7 +328,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         settings: Default::default(),
-        open_docs: Default::default(),
+        documents: Default::default(),
     });
 
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)

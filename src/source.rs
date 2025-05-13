@@ -1,4 +1,4 @@
-use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Range, Sub, SubAssign};
 
 use tower_lsp_server::lsp_types::Position;
 
@@ -9,13 +9,11 @@ pub struct SourceFile {
     text: String,
     /// Line ranges as (start, end)
     lines: Vec<(Size, Size)>,
-    version: i32,
 }
 impl SourceFile {
-    pub fn new(text: String, version: i32) -> Self {
+    pub fn new(text: String) -> Self {
         let mut val = Self {
             text,
-            version,
             lines: Vec::new(),
         };
         val.compute_lines();
@@ -53,8 +51,24 @@ impl SourceFile {
     pub fn text(&self) -> &str {
         &self.text
     }
-    pub fn version(&self) -> i32 {
-        self.version
+    pub fn lines(&self) -> &[(Size, Size)] {
+        &self.lines
+    }
+    pub fn line_start(&self, i: usize) -> Option<Size> {
+        self.lines.get(i).map(|(start, _)| *start)
+    }
+    pub fn line_end(&self, i: usize) -> Option<Size> {
+        self.lines.get(i).map(|(_, end)| *end)
+    }
+    pub fn line_range(&self, range: Range<usize>) -> Option<((Size, Size), &str)> {
+        let start = self.line_start(range.start)?;
+        let end = self.line_end(range.end - 1)?;
+        Some(((start, end), &self.text[start.byte..end.byte]))
+    }
+
+    pub fn replace(&mut self, range: Range<usize>, text: &str) {
+        self.text.replace_range(range, text);
+        self.compute_lines();
     }
 
     /// Convert a utf-16 line/column position to a utf-8 byte offset
@@ -98,18 +112,18 @@ impl SourceFile {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Size {
-    byte: usize,
-    utf16: usize,
+pub struct Size {
+    pub byte: usize,
+    pub utf16: usize,
 }
 impl Size {
-    fn new(s: &str) -> Self {
+    pub fn new(s: &str) -> Self {
         Self {
             byte: s.len(),
             utf16: s.encode_utf16().count(),
         }
     }
-    fn zero() -> Self {
+    pub fn zero() -> Self {
         Self { byte: 0, utf16: 0 }
     }
 }
@@ -150,7 +164,7 @@ mod test {
 
     #[test]
     fn test_lines() {
-        let file = SourceFile::new("Hello\nWorld\n".into(), 0);
+        let file = SourceFile::new("Hello\nWorld\n".into());
         let [a, b, c] = file.lines.try_into().unwrap();
         assert_eq!(a.0.byte, 0);
         assert_eq!(a.1.byte, 6);
@@ -159,7 +173,7 @@ mod test {
         assert_eq!(c.0.byte, 12);
         assert_eq!(c.1.byte, 12);
 
-        let file = SourceFile::new("Hello\nWorld\nFoo".into(), 0);
+        let file = SourceFile::new("Hello\nWorld\nFoo".into());
         let [a, b, c] = file.lines.try_into().unwrap();
         assert_eq!(a.0.byte, 0);
         assert_eq!(a.1.byte, 6);
@@ -168,7 +182,7 @@ mod test {
         assert_eq!(c.0.byte, 12);
         assert_eq!(c.1.byte, 15);
 
-        let file = SourceFile::new("Hello\r\nWorld\r\nFoo".into(), 0);
+        let file = SourceFile::new("Hello\r\nWorld\r\nFoo".into());
         let [a, b, c] = file.lines.try_into().unwrap();
         assert_eq!(a.0.byte, 0);
         assert_eq!(a.1.byte, 7);
@@ -177,7 +191,7 @@ mod test {
         assert_eq!(c.0.byte, 14);
         assert_eq!(c.1.byte, 17);
 
-        let file = SourceFile::new("▲\nWorld\n".into(), 0);
+        let file = SourceFile::new("▲\nWorld\n".into());
         let [a, b, c] = file.lines.try_into().unwrap();
         println!("{:?}", &file.text[a.0.byte..a.1.byte]);
         assert_eq!(a.0.byte, 0);

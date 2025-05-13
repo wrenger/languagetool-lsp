@@ -19,7 +19,7 @@ Choose the `zed` subdirectory.
 
 ## Language Server Installation
 
-The extension **automatically** installs the language server for Linux/x86_64, MacOs/x86_64, and MacOs/aarch64.
+The extension **automatically** installs the language server for Linux/x86_64, macOS/x86_64, and macOS/aarch64.
 
 All other platforms have to build it manually (`cargo b -r`).
 And then add the following Zed configuration:
