@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub mod plaintext;
+
 /// Represents a text with annotations for LanguageTool.
 #[derive(Serialize, Debug, Clone)]
 pub struct AnnotatedText {
@@ -28,6 +30,8 @@ impl AnnotatedText {
         })
     }
     pub fn optimize(&mut self) {
+        // TODO: remove whitespace from start/end
+
         for old in std::mem::take(&mut self.annotation) {
             match (old, self.annotation.last_mut()) {
                 (Annotation::Text { text }, Some(Annotation::Text { text: last_text })) => {

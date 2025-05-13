@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use api::Match;
 use changes::Changes;
 use tokio::sync::RwLock;
@@ -22,7 +22,7 @@ mod settings;
 mod source;
 mod util;
 
-use annotated::AnnotatedText;
+use annotated::plaintext;
 use settings::Settings;
 use source::SourceFile;
 
@@ -227,26 +227,19 @@ impl Backend {
         doc.changed_lines.clear();
 
         for lines in changes {
-            // TODO: Parse markdown/latex/typst
             info!("Check lines: {lines:?}");
 
-            let (line_range, text) = doc
-                .source
-                .line_range(lines.clone())
-                .ok_or_else(|| anyhow!("Invalid Lines"))?;
-
-            if text.trim().is_empty() {
-                info!("Skip checking whitespace");
+            // TODO: Parse markdown/latex/typst
+            let (range, mut annot) = plaintext::annotate(&doc.source, lines)?;
+            annot.optimize();
+            if annot.len() == 0 {
+                info!("Skip empty annotation");
                 continue;
             }
 
-            let mut annot = AnnotatedText::new();
-            annot.add_text(text.into());
-            annot.optimize();
-
-            info!("Check len {}", annot.len());
+            info!("Check {range:?} ({})", annot.len());
             let settings = self.settings.read().await.clone();
-            let mut matches = api::check(annot, line_range.0.byte, &settings, None).await?;
+            let mut matches = api::check(annot, range.start, &settings, None).await?;
             info!("Matches: {}", matches.len());
 
             for m in &matches {
@@ -260,10 +253,9 @@ impl Backend {
                 );
             }
 
-            let line_range = line_range.0.byte..line_range.1.byte;
             // Remove matches that overlap with the changed lines
             doc.matches
-                .retain(|m| m.range.end < line_range.start || m.range.start > line_range.end);
+                .retain(|m| m.range.end < range.start || m.range.start > range.end);
             doc.matches.append(&mut matches);
         }
 
@@ -319,7 +311,7 @@ impl Document {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .without_time()

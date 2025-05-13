@@ -1,7 +1,7 @@
 use std::fs;
 
 use zed::settings::LspSettings;
-use zed_extension_api as zed;
+use zed_extension_api::{self as zed, serde_json};
 
 const NAME: &str = "languagetool-lsp";
 
@@ -126,6 +126,16 @@ impl zed::Extension for Extension {
             args,
             env: vec![],
         })
+    }
+
+    fn language_server_workspace_configuration(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> zed::Result<Option<serde_json::Value>> {
+        println!("Workspace configuration called for {language_server_id}");
+        let lsp_settings = LspSettings::for_worktree(NAME, worktree)?;
+        Ok(lsp_settings.settings)
     }
 }
 

@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::annotated::AnnotatedText;
 use crate::settings::Settings;
@@ -52,9 +52,9 @@ pub async fn check(
     info!("url: {url}");
     let client = reqwest::Client::new();
     let response = client.post(url).form(&params).send().await?;
-    info!("Response: {response:?}");
 
     if !response.status().is_success() {
+        error!("Response: {response:?}");
         if response.status() == reqwest::StatusCode::GATEWAY_TIMEOUT
             || response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
