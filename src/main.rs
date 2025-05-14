@@ -285,8 +285,8 @@ impl Backend {
             info!("Check lines: {lines:?}");
 
             // TODO: Parse markdown/latex/typst
-            let (range, mut annot) = plaintext::annotate(&doc.source, lines)?;
-            annot.optimize();
+            let (mut range, mut annot) = plaintext::annotate(&doc.source, lines)?;
+            range.start += annot.optimize();
             if annot.len() == 0 {
                 info!("Skip empty annotation");
                 continue;

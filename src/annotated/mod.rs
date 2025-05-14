@@ -29,14 +29,24 @@ impl AnnotatedText {
             Annotation::Markup { markup, .. } => markup.as_str(),
         })
     }
-    pub fn optimize(&mut self) {
-        // TODO: remove whitespace from start/end
-
+    pub fn optimize(&mut self) -> usize {
+        let mut offset = 0;
         for old in std::mem::take(&mut self.annotation) {
             match (old, self.annotation.last_mut()) {
+                // Remove whitespace from start
+                (Annotation::Text { text }, None) if text.trim().is_empty() => offset += text.len(),
+                (
+                    Annotation::Markup {
+                        markup,
+                        interpret_as,
+                    },
+                    None,
+                ) if interpret_as.trim().is_empty() => offset += markup.len(),
+                // Concatenate text
                 (Annotation::Text { text }, Some(Annotation::Text { text: last_text })) => {
-                    last_text.push_str(&text);
+                    last_text.push_str(&text)
                 }
+                // Concatenate markup
                 (
                     Annotation::Markup {
                         markup,
@@ -47,17 +57,38 @@ impl AnnotatedText {
                         interpret_as: last_interpret_as,
                     }),
                 ) if interpret_as.is_empty() && last_interpret_as.is_empty() => {
-                    last_markup.push_str(&markup);
+                    last_markup.push_str(&markup)
                 }
                 (old, _) => self.annotation.push(old),
             }
         }
+        // Remove whitespace from end
+        while let Some(annot) = self.annotation.last_mut() {
+            match annot {
+                Annotation::Text { text }
+                | Annotation::Markup {
+                    interpret_as: text, ..
+                } => {
+                    let trimmed = text.trim_end();
+                    if trimmed.is_empty() {
+                        self.annotation.pop();
+                    } else {
+                        text.truncate(trimmed.len());
+                        break;
+                    }
+                }
+            }
+        }
+        offset
     }
     pub fn len(&self) -> usize {
-        self.annotation.iter().map(|a| match a {
-            Annotation::Text { text } => text.len(),
-            Annotation::Markup { markup, .. } => markup.len(),
-        }).sum()
+        self.annotation
+            .iter()
+            .map(|a| match a {
+                Annotation::Text { text } => text.len(),
+                Annotation::Markup { markup, .. } => markup.len(),
+            })
+            .sum()
     }
 }
 
