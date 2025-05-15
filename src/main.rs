@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use api::Match;
+use api::{Match, Synonyms};
 use changes::Changes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -178,6 +178,11 @@ impl LanguageServer for Backend {
         &self,
         params: CodeActionParams,
     ) -> jsonrpc::Result<Option<CodeActionResponse>> {
+        let open_docs = self.documents.read().await;
+        let Some(doc) = open_docs.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+
         let mut actions = Vec::new();
         for diag in params.context.diagnostics {
             if diag.source != Some("languagetool-lsp".into()) {
@@ -218,7 +223,7 @@ impl LanguageServer for Backend {
                 title: "Check Spelling".to_string(),
                 command: "languagetool-lsp.check".to_string(),
                 arguments: Some(vec![
-                    serde_json::to_value(CheckCommandParams {
+                    serde_json::to_value(LTCommandParams {
                         text_document: params.text_document.clone(),
                         range: params.range,
                     })
@@ -227,6 +232,35 @@ impl LanguageServer for Backend {
             }),
             ..Default::default()
         });
+
+        // Synonyms
+        // FIXME: Action is not showing!
+        if let (Some(start), Some(end)) = (
+            doc.source.to_offset(params.range.start),
+            doc.source.to_offset(params.range.start),
+        ) {
+            if let Some(selection) = doc.source.text().get(start..end) {
+                let selection = selection.trim();
+                if !selection.is_empty() && !selection.contains(char::is_whitespace) {
+                    actions.push(CodeAction {
+                        title: format!("Synonyms for {selection}"),
+                        kind: Some(CodeActionKind::SOURCE),
+                        command: Some(lsp_types::Command {
+                            title: format!("Synonyms for {selection}"),
+                            command: "languagetool-lsp.synonyms".to_string(),
+                            arguments: Some(vec![
+                                serde_json::to_value(LTCommandParams {
+                                    text_document: params.text_document.clone(),
+                                    range: params.range,
+                                })
+                                .unwrap(),
+                            ]),
+                        }),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
 
         Ok((!actions.is_empty()).then_some(actions.into_iter().map(|a| a.into()).collect()))
     }
@@ -237,7 +271,7 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<lsp_types::LSPAny>> {
         info!("ExecuteCommand: {:?}", params.command);
         if params.command == "languagetool-lsp.check" {
-            let params = serde_json::from_value::<CheckCommandParams>(params.arguments[0].clone())
+            let params = serde_json::from_value::<LTCommandParams>(params.arguments[0].clone())
                 .map_err(|e| jsonrpc::Error::invalid_params(format!("Invalid params: {e}")))?;
 
             let mut open_docs = self.documents.write().await;
@@ -251,13 +285,51 @@ impl LanguageServer for Backend {
             );
             self.update_diagnostics(&params.text_document.uri, doc)
                 .await;
+        } else if params.command == "languagetool-lsp.synonyms" {
+            let params = serde_json::from_value::<LTCommandParams>(params.arguments[0].clone())
+                .map_err(|e| jsonrpc::Error::invalid_params(format!("Invalid params: {e}")))?;
+
+            let mut open_docs = self.documents.write().await;
+            let Some(doc) = open_docs.get_mut(&params.text_document.uri) else {
+                error!("No document found: {}", params.text_document.uri.as_str());
+                return Ok(None);
+            };
+            let (Some(start), Some(end)) = (
+                doc.source.to_offset(params.range.start),
+                doc.source.to_offset(params.range.end),
+            ) else {
+                error!("Invalid range: {:?}", params.range);
+                return Ok(None);
+            };
+            info!("Synonyms for {:?}", start..end);
+
+            let Some(((pos, _), line)) = doc.source.line_range(start..end) else {
+                error!("Invalid range: {:?}", start..end);
+                return Ok(None);
+            };
+
+            let synonyms = Synonyms::De
+                .query(line, start - pos.byte..end - pos.byte)
+                .await
+                .map_err(|e| jsonrpc::Error::invalid_params(format!("Synonyms: {e}")))?;
+
+            let lint = Match {
+                range: start..end,
+                title: "Synonyms".to_string(),
+                message: format!("Synonyms for {}", &doc.source.text()[start..end]),
+                category: "SYNONYMS".to_string(),
+                rule: "SYNONYMS".to_string(),
+                replacements: synonyms,
+            };
+            doc.matches.push(lint);
+            self.show_diagnostics(&params.text_document.uri, doc).await;
         }
         Ok(None)
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct CheckCommandParams {
+struct LTCommandParams {
     text_document: lsp_types::TextDocumentIdentifier,
     range: lsp_types::Range,
 }
@@ -270,11 +342,15 @@ impl Backend {
                 .show_message(MessageType::ERROR, format!("{err}"))
                 .await;
         } else {
-            let diags = doc.diagnostics();
-            self.client
-                .publish_diagnostics(uri.clone(), diags, doc.version)
-                .await
+            self.show_diagnostics(uri, doc).await;
         }
+    }
+
+    async fn show_diagnostics(&self, uri: &Uri, doc: &mut Document) {
+        let diags = doc.diagnostics();
+        self.client
+            .publish_diagnostics(uri.clone(), diags, doc.version)
+            .await
     }
 
     async fn update_matches(&self, doc: &mut Document) -> Result<()> {

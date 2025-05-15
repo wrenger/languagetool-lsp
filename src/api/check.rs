@@ -1,23 +1,12 @@
-use std::ops::Range;
-
-use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::info;
 
 use crate::annotated::AnnotatedText;
+use crate::api::handle_response_errors;
 use crate::settings::Settings;
 use crate::util::utf16_to_byte;
 
-/// Represents a match (potential issue) found by LanguageTool.
-#[derive(Debug, Clone)]
-pub struct Match {
-    pub range: Range<usize>,
-    pub title: String,
-    pub message: String,
-    pub replacements: Vec<String>,
-    pub category: String,
-    pub rule: String,
-}
+use super::Match;
 
 pub async fn check(
     text: AnnotatedText,
@@ -52,24 +41,7 @@ pub async fn check(
     info!("url: {url}");
     let client = reqwest::Client::new();
     let response = client.post(url).form(&params).send().await?;
-
-    if !response.status().is_success() {
-        error!("Response: {response:?}");
-        if response.status() == reqwest::StatusCode::GATEWAY_TIMEOUT
-            || response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        {
-            return Err(anyhow!(
-                "Request to LanguageTool timed out. Please try again later."
-            ));
-        }
-        let status = response.status();
-        let mut message = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown Error.".to_string());
-        message.truncate(300);
-        return Err(anyhow!("Status: {status}\n{message}",));
-    }
+    let response = handle_response_errors(response).await?;
 
     let response: CheckResponse = response.json().await?;
     info!("Software {:?}", response.software);
