@@ -15,11 +15,11 @@ pub fn utf16_to_byte(chars: impl Iterator<Item = char>, utf16_pos: usize) -> usi
 
 
 pub trait RangeExt {
-    fn overlaps(&self, other: &Self) -> bool;
+    fn touches(&self, other: &Self) -> bool;
 }
 
 impl RangeExt for Range<usize> {
-    fn overlaps(&self, other: &Self) -> bool {
-        self.start < other.end && other.start < self.end
+    fn touches(&self, other: &Self) -> bool {
+        self.start <= other.end && other.start <= self.end
     }
 }

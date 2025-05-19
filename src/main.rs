@@ -372,7 +372,7 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
             info!("ignore {start}..{end}");
-            doc.matches.retain(|m| !m.range.overlaps(&(start..end)));
+            doc.matches.retain(|m| !m.range.touches(&(start..end)));
             self.show_diagnostics(&params.text_document.uri, doc).await;
         }
         Ok(None)
@@ -436,7 +436,7 @@ impl Backend {
             }
 
             // Remove matches that overlap with the changed lines
-            doc.matches.retain(|m| !m.range.overlaps(&range));
+            doc.matches.retain(|m| !m.range.touches(&range));
             doc.matches.append(&mut matches);
         }
 
