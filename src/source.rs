@@ -32,13 +32,13 @@ impl SourceFile {
                     usize::try_from(unsafe { line.as_ptr().offset_from(self.text.as_ptr()) })
                         .expect("line offset");
                 println!("offset {offset}");
-                let curr = last.clone();
+                let curr = last;
                 last += Size::new(&self.text[last.byte..offset]);
                 (curr, last)
             })
             .collect::<Vec<_>>();
 
-        let curr = last.clone();
+        let curr = last;
         last += Size::new(&self.text[last.byte..]);
         lines.push((curr, last));
         // Add the last line (which is ignored by `lines`)

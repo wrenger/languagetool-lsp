@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
+use crate::api::Synonyms;
+
 const ENDPOINTS: [Endpoint; 3] = [
     Endpoint::new("https://api.languagetool.org", 20.0, 20000),
     Endpoint::new("https://api.languagetoolplus.com", 80.0, 75000),
@@ -38,7 +40,7 @@ pub struct Settings {
 
     pub auto_check: bool,
     pub auto_check_delay: f64,
-    pub synonyms: String,
+    pub synonyms: Synonyms,
 
     pub mother_tongue: String,
     pub static_language: Option<String>,
@@ -79,7 +81,7 @@ impl Default for Settings {
             username: String::new(),
             auto_check: true,
             auto_check_delay: ENDPOINTS[0].min_delay(),
-            synonyms: String::new(),
+            synonyms: Synonyms::En,
             mother_tongue: String::new(),
             static_language: None,
             language_variety: [

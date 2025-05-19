@@ -30,8 +30,8 @@ impl Synonyms {
     }
     pub fn url(self) -> &'static str {
         match self {
-            Synonyms::En => "https://qb-grammar-en.languagetool.org/phrasal-paraphraser/subscribe",
-            Synonyms::De => "https://synonyms.languagetool.org/synonyms/de",
+            Synonyms::En => "https://qb-grammar-en.languagetool.org/phrasal-paraphraser/subscribe/",
+            Synonyms::De => "https://synonyms.languagetool.org/synonyms/de/",
         }
     }
 }
