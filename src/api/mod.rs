@@ -6,6 +6,7 @@ mod check;
 pub use check::check;
 mod synonyms;
 pub use synonyms::Synonyms;
+pub mod words;
 
 /// Represents a match (potential issue) found by LanguageTool.
 #[derive(Debug, Clone)]

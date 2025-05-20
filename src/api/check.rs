@@ -36,8 +36,7 @@ pub async fn check(
             .join(","),
     };
 
-    let mut url = settings.server.clone();
-    url.set_path("/v2/check");
+    let url = settings.server.join("v2/check")?;
     info!("url: {url}");
     let client = reqwest::Client::new();
     let response = client.post(url).form(&params).send().await?;

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use api::Match;
 use changes::Changes;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ struct Backend {
     settings: RwLock<Settings>,
     /// Currently open documents
     documents: RwLock<HashMap<Uri, Document>>,
+    dictionary: RwLock<HashSet<String>>,
 }
 
 impl LanguageServer for Backend {
@@ -61,6 +62,7 @@ impl LanguageServer for Backend {
                         "languagetool-lsp.check".to_string(),
                         "languagetool-lsp.synonyms".to_string(),
                         "languagetool-lsp.ignore".to_string(),
+                        "languagetool-lsp.words-add".to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -161,7 +163,14 @@ impl LanguageServer for Backend {
             }
         };
 
-        self.update_diagnostics(&text_document.uri, doc).await;
+        if let Err(err) = self.update_matches(doc).await {
+            error!("Failed diagnostics: {err}\n{}", err.backtrace());
+            self.client
+                .show_message(MessageType::ERROR, format!("{err}"))
+                .await;
+        } else {
+            self.show_diagnostics(&text_document.uri, doc).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -200,8 +209,8 @@ impl LanguageServer for Backend {
             .cloned()
             .collect::<Vec<_>>();
 
-        // Replacements
         for diag in &lt_diags {
+            // Replacements
             if let Some(data) = &diag.data {
                 let data: Vec<String> = serde_json::from_value(data.clone()).unwrap();
                 for replacement in data {
@@ -226,6 +235,34 @@ impl LanguageServer for Backend {
                     });
                 }
             }
+
+            // Add to dictionary
+            if diag.severity == Some(DiagnosticSeverity::WARNING) {
+                if let (Some(start), Some(end)) = (
+                    doc.source.to_offset(diag.range.start),
+                    doc.source.to_offset(diag.range.end),
+                ) {
+                    info!("Add to dictionary {start}..{end}");
+                    let selection = &doc.source.text()[start..end];
+                    actions.push(CodeAction {
+                        title: format!("Add {selection:?} to Dictionary"),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        command: Some(lsp_types::Command {
+                            title: "Add to Dictionary".to_string(),
+                            command: "languagetool-lsp.words-add".to_string(),
+                            arguments: Some(vec![
+                                serde_json::to_value(LTCommandParams {
+                                    text_document: params.text_document.clone(),
+                                    range: diag.range,
+                                })
+                                .unwrap(),
+                            ]),
+                        }),
+                        diagnostics: Some(vec![diag.clone()]),
+                        ..Default::default()
+                    });
+                }
+            }
         }
 
         // Ignore diagnostics
@@ -244,7 +281,7 @@ impl LanguageServer for Backend {
                         .unwrap(),
                     ]),
                 }),
-                diagnostics: Some(lt_diags),
+                diagnostics: Some(lt_diags.clone()),
                 ..Default::default()
             })
         }
@@ -272,27 +309,25 @@ impl LanguageServer for Backend {
             doc.source.to_offset(params.range.start),
             doc.source.to_offset(params.range.end),
         ) {
-            if let Some(selection) = doc.source.text().get(start..end) {
-                let selection = selection.trim();
-                if !selection.is_empty() && !selection.contains(char::is_whitespace) {
-                    info!("add synonyms {start}..{end} {selection:?}");
-                    actions.push(CodeAction {
-                        title: format!("Synonyms for {selection:?}"),
-                        kind: Some(CodeActionKind::SOURCE),
-                        command: Some(lsp_types::Command {
-                            title: "Synonyms".to_string(),
-                            command: "languagetool-lsp.synonyms".to_string(),
-                            arguments: Some(vec![
-                                serde_json::to_value(LTCommandParams {
-                                    text_document: params.text_document.clone(),
-                                    range: params.range,
-                                })
-                                .unwrap(),
-                            ]),
-                        }),
-                        ..Default::default()
-                    });
-                }
+            let selection = doc.source.text()[start..end].trim();
+            if !selection.is_empty() && !selection.contains(char::is_whitespace) {
+                info!("add synonyms {start}..{end} {selection:?}");
+                actions.push(CodeAction {
+                    title: format!("Synonyms for {selection:?}"),
+                    kind: Some(CodeActionKind::SOURCE),
+                    command: Some(lsp_types::Command {
+                        title: "Synonyms".to_string(),
+                        command: "languagetool-lsp.synonyms".to_string(),
+                        arguments: Some(vec![
+                            serde_json::to_value(LTCommandParams {
+                                text_document: params.text_document.clone(),
+                                range: params.range,
+                            })
+                            .unwrap(),
+                        ]),
+                    }),
+                    ..Default::default()
+                });
             }
         }
 
@@ -310,6 +345,13 @@ impl LanguageServer for Backend {
             ..
         } = params;
 
+        if arguments.len() != 1 {
+            error!("Invalid arguments: {arguments:?}");
+            return Err(jsonrpc::Error::invalid_params(
+                "Invalid number of arguments".to_string(),
+            ));
+        }
+
         let first = arguments.remove(0);
         let params = serde_json::from_value::<LTCommandParams>(first)
             .map_err(|e| jsonrpc::Error::invalid_params(format!("Invalid params: {e}")))?;
@@ -320,61 +362,27 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        if command == "languagetool-lsp.check" {
-            doc.changed_lines.add_change(
-                params.range.start.line as usize..params.range.end.line as usize + 1,
-                params.range.end.line as usize - params.range.start.line as usize + 1,
-            );
-            self.update_diagnostics(&params.text_document.uri, doc)
+        let res = match command.as_str() {
+            "languagetool-lsp.check" => self.command_check(params.range, doc).await,
+            "languagetool-lsp.synonyms" => self.command_synonyms(params.range, doc).await,
+            "languagetool-lsp.ignore" => self.command_ignore(params.range, doc).await,
+            "languagetool-lsp.words-add" => self.command_words_add(params.range, doc).await,
+            _ => {
+                error!("Unknown command: {command:?}");
+                return Err(jsonrpc::Error::method_not_found());
+            }
+        };
+
+        if let Err(err) = res {
+            error!("Command failed: {err}\n{}", err.backtrace());
+            self.client
+                .show_message(MessageType::ERROR, format!("{err}"))
                 .await;
-        } else if command == "languagetool-lsp.synonyms" {
-            let (Some(start), Some(end)) = (
-                doc.source.to_offset(params.range.start),
-                doc.source.to_offset(params.range.end),
-            ) else {
-                error!("Invalid range: {:?}", params.range);
-                return Ok(None);
-            };
-            info!("Synonyms for {:?}", start..end);
-
-            let Some(((pos, _), line)) = doc
-                .source
-                .line_range(params.range.start.line as usize..params.range.end.line as usize + 1)
-            else {
-                error!("Invalid range: {:?}", start..end);
-                return Ok(None);
-            };
-
-            let synonyms = self
-                .settings
-                .read()
-                .await
-                .synonyms
-                .query(line, start - pos.byte..end - pos.byte)
-                .await
-                .map_err(|e| jsonrpc::Error::invalid_params(format!("Synonyms: {e}")))?;
-
-            doc.matches.push(Match {
-                range: start..end,
-                title: "Synonyms".to_string(),
-                message: String::new(),
-                category: "SYNONYMS".to_string(),
-                rule: "SYNONYMS".to_string(),
-                replacements: synonyms,
-            });
-            self.show_diagnostics(&params.text_document.uri, doc).await;
-        } else if command == "languagetool-lsp.ignore" {
-            let (Some(start), Some(end)) = (
-                doc.source.to_offset(params.range.start),
-                doc.source.to_offset(params.range.end),
-            ) else {
-                error!("Invalid range: {:?}", params.range);
-                return Ok(None);
-            };
-            info!("ignore {start}..{end}");
-            doc.matches.retain(|m| !m.range.touches(&(start..end)));
+            return Err(jsonrpc::Error::internal_error());
+        } else {
             self.show_diagnostics(&params.text_document.uri, doc).await;
         }
+
         Ok(None)
     }
 }
@@ -386,17 +394,6 @@ struct LTCommandParams {
 }
 
 impl Backend {
-    async fn update_diagnostics(&self, uri: &Uri, doc: &mut Document) {
-        if let Err(err) = self.update_matches(doc).await {
-            error!("Failed diagnostics: {err}");
-            self.client
-                .show_message(MessageType::ERROR, format!("{err}"))
-                .await;
-        } else {
-            self.show_diagnostics(uri, doc).await;
-        }
-    }
-
     async fn show_diagnostics(&self, uri: &Uri, doc: &mut Document) {
         let diags = doc.diagnostics();
         self.client
@@ -435,11 +432,130 @@ impl Backend {
                 );
             }
 
+            // Remove spelling matches part of the dictionary
+            if !settings.sync_dictionary {
+                let dict = self.dictionary.read().await;
+                matches = matches
+                    .into_iter()
+                    .filter(|m| {
+                        !(m.category == "TYPOS"
+                            && dict.contains(&doc.source.text()[m.range.clone()]))
+                    })
+                    .collect();
+            }
+
             // Remove matches that overlap with the changed lines
             doc.matches.retain(|m| !m.range.touches(&range));
             doc.matches.append(&mut matches);
+            doc.matches.sort_by_key(|m| m.range.start);
         }
 
+        Ok(())
+    }
+
+    async fn command_check(&self, range: lsp_types::Range, doc: &mut Document) -> Result<()> {
+        doc.changed_lines.add_change(
+            range.start.line as usize..range.end.line as usize + 1,
+            range.end.line as usize - range.start.line as usize + 1,
+        );
+        self.update_matches(doc).await
+    }
+
+    async fn command_synonyms(&self, range: lsp_types::Range, doc: &mut Document) -> Result<()> {
+        let (Some(start), Some(end)) = (
+            doc.source.to_offset(range.start),
+            doc.source.to_offset(range.end),
+        ) else {
+            return Err(anyhow!("Invalid range: {:?}", range));
+        };
+        info!("Synonyms for {:?}", start..end);
+
+        let Some(((pos, _), line)) = doc
+            .source
+            .line_range(range.start.line as usize..range.end.line as usize + 1)
+        else {
+            return Err(anyhow!("Invalid range: {:?}", start..end));
+        };
+
+        let synonyms = self
+            .settings
+            .read()
+            .await
+            .synonyms
+            .query(line, start - pos.byte..end - pos.byte)
+            .await
+            .map_err(|e| jsonrpc::Error::invalid_params(format!("Synonyms: {e}")))?;
+
+        doc.matches.push(Match {
+            range: start..end,
+            title: "Synonyms".to_string(),
+            message: String::new(),
+            category: "SYNONYMS".to_string(),
+            rule: "SYNONYMS".to_string(),
+            replacements: synonyms,
+        });
+        Ok(())
+    }
+
+    async fn command_ignore(&self, range: lsp_types::Range, doc: &mut Document) -> Result<()> {
+        let (Some(start), Some(end)) = (
+            doc.source.to_offset(range.start),
+            doc.source.to_offset(range.end),
+        ) else {
+            return Err(anyhow!("Invalid range: {:?}", range));
+        };
+        info!("ignore {start}..{end}");
+        doc.matches.retain(|m| !m.range.touches(&(start..end)));
+        Ok(())
+    }
+
+    async fn command_words_add(&self, range: lsp_types::Range, doc: &mut Document) -> Result<()> {
+        let (Some(start), Some(end)) = (
+            doc.source.to_offset(range.start),
+            doc.source.to_offset(range.end),
+        ) else {
+            return Err(anyhow!("Invalid range: {:?}", range));
+        };
+        let Some(word) = doc.source.text().get(start..end) else {
+            return Err(anyhow!("Invalid range: {:?}", range));
+        };
+        info!("add word {word:?}");
+        let settings = self.settings.read().await.clone();
+
+        if settings.sync_dictionary && (settings.username.is_empty() || settings.api_key.is_empty())
+        {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    "Syncing words is only supported for premium users",
+                )
+                .await;
+        }
+
+        if settings.sync_dictionary && !settings.username.is_empty() && !settings.api_key.is_empty()
+        {
+            info!("Add {word:?} to remote dict");
+            api::words::add(&settings, word).await?;
+            self.client
+                .show_message(
+                    MessageType::INFO,
+                    format!("Added {word:?} to remote dictionary"),
+                )
+                .await;
+        } else {
+            info!("Add {word:?} to local dict");
+            self.dictionary.write().await.insert(word.to_string());
+            self.client
+                .show_message(
+                    MessageType::INFO,
+                    format!("Added {word:?} to local dictionary"),
+                )
+                .await;
+        }
+
+        // Remove corresponding matches
+        doc.matches
+            .retain(|m| !(m.category == "TYPOS" && word == &doc.source.text()[m.range.clone()]));
         Ok(())
     }
 }
@@ -502,6 +618,7 @@ async fn main() {
         client,
         settings: Default::default(),
         documents: Default::default(),
+        dictionary: Default::default(),
     });
 
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
