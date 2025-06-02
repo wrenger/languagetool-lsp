@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::annotated::AnnotatedText;
 use crate::api::handle_response_errors;
@@ -26,8 +26,8 @@ pub async fn check(
         mother_tongue: &settings.mother_tongue,
         enabled_categories: &settings.enabled_categories,
         disabled_categories: &settings.disabled_categories,
-        enabled_rule: &settings.enabled_rules,
-        disabled_rule: &settings.disabled_rules,
+        enabled_rules: &settings.enabled_rules.join(","),
+        disabled_rules: &settings.disabled_rules.join(","),
         preferred_variants: &settings
             .language_variety
             .values()
@@ -38,6 +38,7 @@ pub async fn check(
 
     let url = settings.server.join("v2/check")?;
     info!("url: {url}");
+    debug!("params: {params:?}");
     let client = reqwest::Client::new();
     let response = client.post(url).form(&params).send().await?;
     let response = handle_response_errors(response).await?;
@@ -141,10 +142,10 @@ struct CheckParams<'a> {
     disabled_categories: &'a str,
     /// Comma-separated list of enabled rules.
     #[serde(skip_serializing_if = "str::is_empty")]
-    enabled_rule: &'a str,
+    enabled_rules: &'a str,
     /// Comma-separated list of disabled rules.
     #[serde(skip_serializing_if = "str::is_empty")]
-    disabled_rule: &'a str,
+    disabled_rules: &'a str,
     /// Comma-separated list of preferred language variants.
     #[serde(skip_serializing_if = "str::is_empty")]
     preferred_variants: &'a str,

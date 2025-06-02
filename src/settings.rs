@@ -54,8 +54,8 @@ pub struct Settings {
     pub picky: bool,
     pub enabled_categories: String,
     pub disabled_categories: String,
-    pub enabled_rules: String,
-    pub disabled_rules: String,
+    pub enabled_rules: Vec<String>,
+    pub disabled_rules: Vec<String>,
 }
 
 mod serde_url {
@@ -97,8 +97,8 @@ impl Default for Settings {
             picky: false,
             enabled_categories: String::new(),
             disabled_categories: String::new(),
-            enabled_rules: String::new(),
-            disabled_rules: String::new(),
+            enabled_rules: Vec::new(),
+            disabled_rules: Vec::new(),
         }
     }
 }
